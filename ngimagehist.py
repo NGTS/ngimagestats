@@ -9,12 +9,30 @@ import matplotlib
 import matplotlib.pyplot as plt
 import os
 import argparse
+from bz2 import BZ2File
+from tempfile import NamedTemporaryFile
+from contextlib import contextmanager
 
 try:
     plt.style.use('bmh')
 except (IOError, ValueError):
     # Styles are not available
     pass
+
+@contextmanager
+def open_fits(filename, *args, **kwargs):
+    if filename.endswith('.bz2'):
+        with NamedTemporaryFile(suffix='.fits') as tfile:
+            with BZ2File(filename) as uncompressed:
+                tfile.write(uncompressed.read())
+
+            tfile.seek(0)
+            with fitsio.FITS(tfile.name, *args, **kwargs) as infile:
+                yield infile
+    else:
+        with fitsio.FITS(filename, *args, **kwargs) as infile:
+            yield infile
+                
 
 def remove_overscan(image):
     overscan = image[4:, -15:].mean()
@@ -36,7 +54,7 @@ def pick_central_region(image, margin=8):
     return image[margin:y-margin, margin:x-margin]
 
 def render_profile(filename, axis, meta, label=''):
-    with fitsio.FITS(filename) as infile:
+    with open_fits(filename) as infile:
         header = infile[0].read_header()
         image = infile[0].read()
 
