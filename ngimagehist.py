@@ -1,17 +1,14 @@
-#!/usr/bin/env python
+#!/usr/local/python/bin/python
 # -*- coding: utf-8 -*-
 
+from __future__ import division, print_function, absolute_import
 import subprocess as sp
-from extract_metadata import Session, Metadata
 import fitsio
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from sqlalchemy.sql import func
-from sqlalchemy import desc
-import sqlite3
 import os
+import argparse
 
 try:
     plt.style.use('bmh')
@@ -19,12 +16,7 @@ except (IOError, ValueError):
     # Styles are not available
     pass
 
-bin_min = 1E3
-bin_max = 5E5
-
 def remove_overscan(image):
-    # return image[:, 20:-20]
-
     overscan = image[4:, -15:].mean()
     return image[:, 20:-20] - overscan
 
@@ -43,127 +35,71 @@ def pick_central_region(image, margin=8):
     x, y = image.shape
     return image[margin:y-margin, margin:x-margin]
 
-def render_profile(filename, axis, label, gain_value, colour):
+def render_profile(filename, axis, meta, label=''):
     with fitsio.FITS(filename) as infile:
         header = infile[0].read_header()
         image = infile[0].read()
 
+    image_electrons = image * meta.get('gain', 1.)
 
-    if image.shape[1] == 2088:
-        image = remove_overscan(image)
-    assert image.shape == (2048, 2048)
-    image = pick_central_region(image)
-
-    image_electrons = image * gain_value
-    assert image_electrons.shape[0] < 2048 and image_electrons.shape[1] < 2048
-
-    # camera_id = header.get('CAMERAID', 'UNKNOWN')
-    # gain = header.get('GAIN', 'UNKNOWN')
-    # exptime = header.get('EXPTIME', None) or header.get('EXPOSURE', 'UNKNOWN')
-
-    x, y = compute_histogram(image_electrons, bins=200,
-                            range=(np.log10(bin_min), np.log10(bin_max)))
-
-    # title = 'Camera {camera_id}; gain {gain}; exptime {exptime}'.format(
-    #     camera_id=camera_id, gain=gain, exptime=exptime)
-
-    # locator = plt.LogLocator(subs=[1, 2, 5])
-    # formatter = plt.LogFormatter(labelOnlyBase=False)
-
-    # fig, axis = plt.subplots()
-    l, = axis.loglog(x, y, label=label, lw=1, color=colour)
-    # axis.axvline(2 ** 16 - 1)
-    # axis.set(xlim=(100, 70000), xlabel='Pixel value', ylim=(1E-1, 1E7), ylabel='Number', title=title)
-    # axis.xaxis.set_major_locator(locator)
-    # axis.xaxis.set_major_formatter(formatter)
-    # fig.tight_layout()
-    # fig.savefig(args.output, bbox_inches='tight')
+    x, y = compute_histogram(image_electrons, bins=200)
+    l, = axis.loglog(x, y, label=label, lw=1)
     return l, x, y
 
-def fetch_camera_gain_mapping(filename):
-    with sqlite3.connect(filename) as con:
-        cur = con.cursor()
-        cur.execute('select camera_id, gain_setting, gain_value from camera_gains')
-        rows = cur.fetchall()
-
-    out = {}
-    for (camera_id, gain_setting, gain_value) in rows:
-        out[(camera_id, gain_setting)] = gain_value
-    return out
 
 
-if __name__ == '__main__':
-    session = Session()
+def extract_meta(filename):
+    header = fitsio.read_header(filename)
+    return {
+        'image_id': header.get('IMAGE_ID', None),
+        'gain': header.get('GAINFACT', None),
+        'gain_setting': header.get('GAIN', None),
+        'camera_id': header.get('CAMERAID', None),
+        'vi+': header.get('VI_PLUS', None),
+    }
 
-    # meta = session.query(Metadata, func.count(Metadata.camera_id)).filter(
-    #     (Metadata.exposure_time == 30) & (Metadata.vi == 227) & (Metadata.cycle == 1)
-    # ).group_by(Metadata.camera_id)
-
-    output_dir = 'histograms'
+def main(args):
 
     locator = plt.LogLocator(subs=[1, 2, 5])
     formatter = plt.LogFormatter(labelOnlyBase=False)
 
-    camera_gain_mapping = fetch_camera_gain_mapping('metadata.db')
 
 
-    camera_ids = session.query(Metadata.camera_id).filter(
-        ~Metadata.camera_id.in_({802})
-    ).distinct().all()
-    vis = session.query(Metadata.vi).distinct().all()
+    fig, axis = plt.subplots()
+    for filename in args.filename:
+        meta = extract_meta(filename)
+        if args.override_meta:
+            for entry in args.override_meta:
+                key, value = entry.split('=')
+                if key not in meta:
+                    raise ValueError("Unsupported key: %s. Available: %s" % (
+                        key, meta.keys()))
 
-    colours = {4: u'#348ABD', 2: u'#A60628', 1: u'#7A68A6'}
-    for camera_id, in camera_ids:
-        for vi, in vis:
-            metas = session.query(Metadata).filter(
-                (Metadata.camera_id == camera_id) & (Metadata.exposure_time == 30) & (Metadata.vi == vi) & (Metadata.cycle == 1) & (Metadata.gain_setting != 4)
-            ).order_by(desc(Metadata.gain_setting)).all()
+                value_type = type(meta[key])
+                meta[key] = value_type(value)
 
+        l, _, _ = render_profile(filename, axis, meta=meta)
 
-            output_filename = os.path.join(output_dir, 'histogram_{camera_id}_{vi}.png'.format(
-                camera_id=camera_id, vi=vi))
-            print(output_filename)
+        axis.axvline((2 ** 16 - 1) * meta.get('gain', 1.), color=l.get_color(), alpha=0.5,
+                    ls='--')
 
-            fig, axis = plt.subplots()
-            lines = []
-            for meta in metas:
-                gain_value = camera_gain_mapping[(camera_id, meta.gain_setting)]
-                l, x, y = render_profile(meta.filename, axis, meta.gain_setting, gain_value,
-                                  colour=colours[meta.gain_setting])
-                lines.append((x, y))
-                axis.axvline((2 ** 16 - 1) * gain_value, color=l.get_color(), alpha=0.5,
-                            ls='--')
+    # axis.axvline(bin_max, ls='--', color='k')
+    # title = 'Camera {camera_id}; VI+{vi+}'.format(**meta)
+    # axis.axvline(2 ** 16 - 1)
+    axis.set(xlim=(100 1E6), xlabel='Pixel value [electrons]', ylim=(1E-1, 1E7), ylabel='Number')
+    axis.xaxis.set_major_locator(locator)
+    axis.xaxis.set_major_formatter(formatter)
+    fig.tight_layout()
 
+    if args.output:
+        fig.savefig(args.output)
+    else:
+        plt.show()
 
-            # axis.axvline(bin_max, ls='--', color='k')
-            title = 'Camera {camera_id}; VI+{vi}'.format(
-                camera_id=camera_id, vi=vi)
-            # axis.axvline(2 ** 16 - 1)
-            axis.legend(loc='best')
-            axis.set(xlim=(1000, 1E6), xlabel='Pixel value [electrons]', ylim=(1E-1, 1E7), ylabel='Number', title=title)
-            axis.xaxis.set_major_locator(locator)
-            axis.xaxis.set_major_formatter(formatter)
-            fig.tight_layout()
-
-            fig.savefig(output_filename)
-            plt.close(fig)
-
-
-
-
-
-
-
-
-
-
-
-
-
-    # output_filename = '{output_dir}/hist_{camera_id}_{vi}_{gain}_{cycle}.png'.format(
-    #     output_dir=output_dir, camera_id=entry.camera_id, vi=entry.vi, gain=entry.gain_setting,
-    #     cycle=entry.cycle)
-    # cmd = ['python', '../attempt-1/render_image_histogram.py', entry.filename, '-o', output_filename]
-    # print(cmd)
-    # sp.check_call(cmd)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('filename', nargs='+')
+    parser.add_argument('-m', '--override-meta', required=False, nargs='*')
+    parser.add_argument('-o', '--output', required=False)
+    main(parser.parse_args())
 
